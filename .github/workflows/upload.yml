@@ -1,0 +1,51 @@
+name: Yummy Foodie — Bulk Upload to ShortSync
+
+on:
+  workflow_dispatch:   # Run manually from GitHub Actions tab
+  schedule:
+    - cron: '0 6 * * *'  # Also runs daily at 6am UTC (optional — remove if not needed)
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hour max — enough for 637 videos
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore upload state (so re-runs skip completed files)
+        uses: actions/cache@v4
+        with:
+          path: upload_state.json
+          key: upload-state-${{ github.run_number }}
+          restore-keys: upload-state-
+
+      - name: Run uploader
+        env:
+          SHORTSYNC_API_KEY:       ${{ secrets.SHORTSYNC_API_KEY }}
+          GDRIVE_FOLDER_ID:        ${{ secrets.GDRIVE_FOLDER_ID }}
+          SNAPCHAT_CONNECTION_ID:  ${{ secrets.SNAPCHAT_CONNECTION_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python upload_to_shortsync.py
+
+      - name: Save upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upload-state
+          path: upload_state.json
