@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Yummy Foodie — Google Drive → ShortSync bulk uploader
-Uses OAuth2 refresh token (no service account needed).
+Uses OAuth2 refresh token. Handles SSL timeouts, saves state correctly.
 """
 
 import os, io, json, time, logging, requests
@@ -9,21 +9,21 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 
-# ── Config ───────────────────────────────────────────────────────────────────
 SHORTSYNC_API_KEY  = os.environ["SHORTSYNC_API_KEY"]
 GDRIVE_FOLDER_ID   = os.environ["GDRIVE_FOLDER_ID"]
 SNAPCHAT_CONN_ID   = os.environ["SNAPCHAT_CONNECTION_ID"]
-GOOGLE_TOKEN_JSON  = os.environ["GOOGLE_TOKEN_JSON"]   # full token JSON string
+GOOGLE_TOKEN_JSON  = os.environ["GOOGLE_TOKEN_JSON"]
 
 SHORTSYNC_BASE     = "https://api.shortsync.app/v1"
-RATE_LIMIT_DELAY   = 1.2
-MAX_RETRIES        = 3
+RATE_LIMIT_DELAY   = 1.5
+MAX_RETRIES        = 4
+DOWNLOAD_TIMEOUT   = 600  # 10 min per file
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Google Drive client (OAuth refresh token) ────────────────────────────────
 def get_drive_service():
     token_data = json.loads(GOOGLE_TOKEN_JSON)
     creds = Credentials(
@@ -34,10 +34,9 @@ def get_drive_service():
         client_secret=token_data["client_secret"],
         scopes=["https://www.googleapis.com/auth/drive.readonly"]
     )
-    if creds.expired or not creds.valid:
+    if not creds.valid:
         creds.refresh(Request())
     return build("drive", "v3", credentials=creds, cache_discovery=False)
-
 
 def list_drive_videos(service, folder_id):
     videos, page_token = [], None
@@ -55,28 +54,33 @@ def list_drive_videos(service, folder_id):
     log.info(f"Found {len(videos)} videos in Drive folder")
     return videos
 
-
 def download_video_bytes(service, file_id, file_name):
     log.info(f"  Downloading: {file_name}")
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(
-        buf, service.files().get_media(fileId=file_id), chunksize=8*1024*1024)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    buf.seek(0)
-    return buf.read()
+    for attempt in range(MAX_RETRIES):
+        try:
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(
+                buf, service.files().get_media(fileId=file_id), chunksize=16*1024*1024)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            buf.seek(0)
+            return buf.read()
+        except Exception as e:
+            log.warning(f"  Download attempt {attempt+1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(10 * (attempt + 1))
+            else:
+                raise
 
-
-# ── ShortSync helpers ─────────────────────────────────────────────────────────
 SS_HEADERS = {"Authorization": f"Bearer {SHORTSYNC_API_KEY}", "Content-Type": "application/json"}
 
 def ss_get_upload_slot(filename):
-    for _ in range(MAX_RETRIES):
+    for attempt in range(MAX_RETRIES):
         r = requests.post(f"{SHORTSYNC_BASE}/uploads", headers=SS_HEADERS,
                           json={"filename": filename}, timeout=30)
         if r.status_code == 429:
-            time.sleep(int(r.headers.get("Retry-After", 15))); continue
+            time.sleep(int(r.headers.get("Retry-After", 20))); continue
         r.raise_for_status()
         return r.json()
     raise RuntimeError("Failed to get upload slot")
@@ -85,7 +89,16 @@ def ss_put_video(presigned_url, video_bytes, required_headers=None):
     headers = {"Content-Type": "video/mp4"}
     if required_headers:
         headers.update(required_headers)
-    requests.put(presigned_url, data=video_bytes, headers=headers, timeout=300).raise_for_status()
+    for attempt in range(MAX_RETRIES):
+        try:
+            requests.put(presigned_url, data=video_bytes, headers=headers, timeout=600).raise_for_status()
+            return
+        except Exception as e:
+            log.warning(f"  Upload attempt {attempt+1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(10)
+            else:
+                raise
 
 def ss_create_draft(upload_id):
     payload = {
@@ -98,29 +111,30 @@ def ss_create_draft(upload_id):
             }
         }]
     }
-    for _ in range(MAX_RETRIES):
+    for attempt in range(MAX_RETRIES):
         r = requests.post(f"{SHORTSYNC_BASE}/posts", headers=SS_HEADERS,
                           json=payload, timeout=30)
         if r.status_code == 429:
-            time.sleep(int(r.headers.get("Retry-After", 15))); continue
+            time.sleep(int(r.headers.get("Retry-After", 20))); continue
         r.raise_for_status()
         return r.json()
     raise RuntimeError("Failed to create draft")
 
-
-# ── State (skip already-uploaded files on re-runs) ───────────────────────────
 STATE_FILE = "upload_state.json"
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f: return json.load(f)
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+            log.info(f"Loaded state: {len(state['done'])} already done")
+            return state
+    log.info("No state file found — starting fresh")
     return {"done": []}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     state = load_state()
     done_ids = set(state["done"])
@@ -133,6 +147,7 @@ def main():
     success = fail = 0
     for i, vid in enumerate(todo, 1):
         log.info(f"[{i}/{len(todo)}] {vid['name']}")
+        video_bytes = None
         try:
             video_bytes = download_video_bytes(drive, vid["id"], vid["name"])
             time.sleep(RATE_LIMIT_DELAY)
@@ -141,17 +156,19 @@ def main():
             time.sleep(RATE_LIMIT_DELAY)
             result = ss_create_draft(slot["upload_id"])
             statuses = [p.get("status") for p in result.get("data", [])]
-            log.info(f"  Draft created — {statuses}")
+            log.info(f"  ✅ Draft created — {statuses}")
             done_ids.add(vid["id"])
             state["done"].append(vid["id"])
             save_state(state)
             success += 1
         except Exception as e:
-            log.error(f"  FAILED: {e}")
+            log.error(f"  ❌ FAILED: {e}")
             fail += 1
-        del video_bytes
+        finally:
+            if video_bytes is not None:
+                del video_bytes
 
-    log.info(f"\n✅ Done — Success: {success}  Failed: {fail}")
+    log.info(f"\n✅ Done — Success: {success}  Failed: {fail}  Already done: {len(done_ids) - success}")
 
 if __name__ == "__main__":
     main()
